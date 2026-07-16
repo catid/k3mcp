@@ -13,6 +13,9 @@ The server cannot read or modify local files. The MCP client chooses what code a
 Submitted content is treated as untrusted data, and Kimi's private reasoning is excluded from tool
 results. Responses include token usage, cost, latency, provider, and retry metadata.
 
+The tools are strictly opt-in. Server instructions tell the MCP client not to call them for routine
+reviews or planning; explicitly mention Kimi, K3, the Kimi MCP, or a tool name when you want a call.
+
 ## Requirements
 
 - Python 3.11 or newer
@@ -92,7 +95,12 @@ uv run pytest
 Tests use a mocked OpenRouter transport and a real MCP stdio handshake; they do not spend API
 credits. Retry tests cover network failures, rate limits, every `5xx` status, malformed or empty
 successful responses, and OpenRouter's occasional transient `invalid model ID` response for an
-otherwise live model slug. Retries use bounded exponential backoff and honor `Retry-After`.
+otherwise live model slug. OpenRouter can report provider failures inside HTTP `200` responses;
+those are classified by their embedded status so billing, authentication, guardrail, and token-cap
+errors are not retried. Retries use bounded exponential backoff and honor `Retry-After`.
+
+GitHub Actions runs linting, formatting, tests, the stdio protocol handshake, and package builds on
+Python 3.11, 3.12, and 3.13. Workflow actions are pinned to immutable commit SHAs.
 
 ## Security and cost
 

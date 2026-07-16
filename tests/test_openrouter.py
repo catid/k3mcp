@@ -188,6 +188,84 @@ async def test_retries_malformed_usage_shape() -> None:
     assert result.analysis == "VERDICT: CORRECT"
 
 
+@pytest.mark.asyncio
+async def test_retries_retryable_error_inside_http_200() -> None:
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(
+                200,
+                json={"error": {"code": 503, "message": "provider unavailable"}},
+            )
+        return httpx.Response(200, json=_success())
+
+    async def sleep(_delay: float) -> None:
+        return None
+
+    settings = Settings.from_env({"OPENROUTER_API_KEY": "test-key"})
+    client = OpenRouterClient(
+        settings,
+        transport=httpx.MockTransport(handler),
+        sleep=sleep,
+    )
+    try:
+        result = await client.complete(system="system", user="user")
+    finally:
+        await client.aclose()
+
+    assert attempts == 2
+    assert result.analysis == "VERDICT: CORRECT"
+
+
+@pytest.mark.asyncio
+async def test_does_not_retry_nonretryable_error_inside_http_200() -> None:
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            200,
+            json={"error": {"code": 402, "message": "insufficient credits"}},
+        )
+
+    settings = Settings.from_env({"OPENROUTER_API_KEY": "test-key"})
+    client = OpenRouterClient(settings, transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(OpenRouterError, match="in-body error 402: insufficient credits"):
+            await client.complete(system="system", user="user")
+    finally:
+        await client.aclose()
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_does_not_retry_empty_completion_caused_by_token_limit() -> None:
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        payload = _success()
+        payload["choices"][0]["finish_reason"] = "length"  # type: ignore[index]
+        payload["choices"][0]["message"]["content"] = None  # type: ignore[index]
+        return httpx.Response(200, json=payload)
+
+    settings = Settings.from_env({"OPENROUTER_API_KEY": "test-key"})
+    client = OpenRouterClient(settings, transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(OpenRouterError, match="exhausted max_tokens"):
+            await client.complete(system="system", user="user")
+    finally:
+        await client.aclose()
+
+    assert attempts == 1
+
+
 def test_completion_result_marks_length_truncation() -> None:
     payload = _success()
     payload["choices"][0]["finish_reason"] = "length"  # type: ignore[index]

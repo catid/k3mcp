@@ -18,6 +18,14 @@ class OpenRouterError(RuntimeError):
     """A safe-to-display OpenRouter request or response failure."""
 
 
+class OpenRouterResponseError(OpenRouterError):
+    """An error envelope returned by OpenRouter, possibly inside an HTTP 200."""
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
 @dataclass(frozen=True, slots=True)
 class CompletionResult:
     """A model answer plus operational metadata, excluding private reasoning."""
@@ -82,6 +90,34 @@ def _content_text(content: Any) -> str:
         ]
         return "\n".join(chunks).strip()
     return ""
+
+
+def _is_retryable_code(code: int | None, message: str) -> bool:
+    if code in {408, 409, 425, 429} or (code is not None and 500 <= code < 600):
+        return True
+    return code == 400 and "not a valid model id" in message.lower()
+
+
+def _in_body_error(payload: dict[str, Any]) -> OpenRouterResponseError | None:
+    error = payload.get("error")
+    if error is None:
+        return None
+    if isinstance(error, dict):
+        message_value = error.get("message")
+        message = message_value if isinstance(message_value, str) else "unrecognized error response"
+        code_value = error.get("code")
+    else:
+        message = error if isinstance(error, str) else "unrecognized error response"
+        code_value = None
+    try:
+        code = int(code_value) if code_value is not None else None
+    except (TypeError, ValueError):
+        code = None
+    label = str(code) if code is not None else "unknown"
+    return OpenRouterResponseError(
+        f"OpenRouter in-body error {label}: {message[:1_000]}",
+        retryable=_is_retryable_code(code, message),
+    )
 
 
 class OpenRouterClient:
@@ -154,6 +190,12 @@ class OpenRouterClient:
                         latency_seconds=time.perf_counter() - started,
                         attempts=attempt,
                     )
+                except OpenRouterResponseError as exc:
+                    last_error = str(exc)
+                    if exc.retryable and attempt < total_attempts:
+                        await self._sleep(min(2 ** (attempt - 1), 8))
+                        continue
+                    raise
                 except OpenRouterError as exc:
                     # A 2xx with no usable assistant message is still an upstream failure.
                     # Retrying covers truncated reasoning-only and malformed provider responses.
@@ -164,14 +206,7 @@ class OpenRouterClient:
                     raise
 
             last_error = _error_message(response)
-            retryable = response.status_code in {408, 409, 425, 429} or (
-                500 <= response.status_code < 600
-            )
-            # OpenRouter has occasionally returned this transient 400 while the same live slug
-            # succeeds concurrently. Retrying this exact message is safe and improves reliability.
-            retryable = retryable or (
-                response.status_code == 400 and "not a valid model id" in last_error.lower()
-            )
+            retryable = _is_retryable_code(response.status_code, last_error)
             if retryable and attempt < total_attempts:
                 retry_after = response.headers.get("Retry-After")
                 try:
@@ -191,14 +226,25 @@ class OpenRouterClient:
             payload = response.json()
             if not isinstance(payload, dict):
                 raise TypeError("completion payload is not an object")
+            in_body_error = _in_body_error(payload)
+            if in_body_error is not None:
+                raise in_body_error
             choice = payload["choices"][0]
             if not isinstance(choice, dict):
                 raise TypeError("completion choice is not an object")
             message = choice["message"]
             if not isinstance(message, dict):
                 raise TypeError("completion message is not an object")
+            finish_reason_value = choice.get("finish_reason")
+            finish_reason = str(finish_reason_value) if finish_reason_value is not None else None
             content = _content_text(message.get("content"))
             if not content:
+                if finish_reason == "length":
+                    raise OpenRouterResponseError(
+                        "OpenRouter exhausted max_tokens before producing a final answer; "
+                        "increase K3MCP_MAX_TOKENS or reduce the submitted context",
+                        retryable=False,
+                    )
                 raise OpenRouterError("OpenRouter returned an empty completion")
 
             usage = payload.get("usage") or {}
@@ -212,8 +258,6 @@ class OpenRouterClient:
             if cost is not None and not math.isfinite(cost):
                 raise ValueError("cost is not finite")
 
-            finish_reason_value = choice.get("finish_reason")
-            finish_reason = str(finish_reason_value) if finish_reason_value is not None else None
             prompt_tokens = int(usage.get("prompt_tokens") or 0)
             completion_tokens = int(usage.get("completion_tokens") or 0)
             reasoning_tokens = int(completion_details.get("reasoning_tokens") or 0)

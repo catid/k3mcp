@@ -23,12 +23,12 @@ from k3mcp.prompts import (
     planning_prompt,
 )
 
-SERVER_INSTRUCTIONS = """Use these read-only tools to get a Kimi K3 second opinion on algorithms,
-code or diffs, and project plans. Supply complete requirements and the relevant evidence because
-Kimi cannot read the workspace. Treat its response as advisory: verify findings before changing
-code. Prefer review_algorithm for proofs, invariants, complexity, and counterexamples;
-review_code for concrete implementation defects; and plan_project before substantial multi-stage
-work. Calls use OpenRouter, incur usage cost, and may take several minutes."""
+SERVER_INSTRUCTIONS = """These Kimi K3 tools are strictly opt-in. Call them only when the user
+explicitly asks to use Kimi, K3, the Kimi MCP, or one of this server's named tools. Never call them
+automatically for an ordinary algorithm discussion, code review, or planning request. When asked,
+supply complete requirements and relevant evidence because Kimi cannot read the workspace. Treat
+its response as advisory and verify it before changing code. Calls use OpenRouter, incur usage
+cost, and may take several minutes."""
 
 READ_ONLY_EXTERNAL = ToolAnnotations(
     readOnlyHint=True,
@@ -100,7 +100,7 @@ async def review_algorithm(
         ),
     ] = "",
 ) -> dict[str, Any]:
-    """Challenge an algorithm's correctness, invariants, edge cases, and complexity."""
+    """Only when explicitly requested, ask Kimi K3 to challenge an algorithm."""
     await ctx.info("Asking Kimi K3 to review the algorithm")
     result = await _client(ctx).complete(
         system=ALGORITHM_SYSTEM,
@@ -149,7 +149,7 @@ async def review_code(
         ),
     ] = "",
 ) -> dict[str, Any]:
-    """Find concrete correctness, security, reliability, and performance defects."""
+    """Only when explicitly requested, ask Kimi K3 to review code or a diff."""
     await ctx.info("Asking Kimi K3 to review the code")
     result = await _client(ctx).complete(
         system=CODE_REVIEW_SYSTEM,
@@ -198,7 +198,7 @@ async def plan_project(
         ),
     ] = "",
 ) -> dict[str, Any]:
-    """Create a project plan with dependencies, verification, risks, and rollback."""
+    """Only when explicitly requested, ask Kimi K3 to create a project plan."""
     await ctx.info("Asking Kimi K3 to produce a project plan")
     result = await _client(ctx).complete(
         system=PLANNING_SYSTEM,
