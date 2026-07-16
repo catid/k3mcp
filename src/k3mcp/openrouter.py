@@ -7,6 +7,8 @@ import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -24,6 +26,10 @@ class OpenRouterResponseError(OpenRouterError):
     def __init__(self, message: str, *, retryable: bool) -> None:
         super().__init__(message)
         self.retryable = retryable
+
+
+_MAX_AMBIGUOUS_ATTEMPTS = 2
+_MAX_RETRY_AFTER_SECONDS = 300.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +104,48 @@ def _is_retryable_code(code: int | None, message: str) -> bool:
     return code == 400 and "not a valid model id" in message.lower()
 
 
+def _retry_delay(
+    attempt: int, retry_after: str | None = None, *, now: float | None = None
+) -> float | None:
+    fallback = 30 if attempt >= 6 else 2 ** (attempt - 1)
+    if retry_after is None:
+        return float(fallback)
+    try:
+        requested = float(retry_after)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(retry_after)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            requested = retry_at.timestamp() - (time.time() if now is None else now)
+        except (OverflowError, TypeError, ValueError):
+            return float(fallback)
+        requested = max(requested, 0.0)
+    if not math.isfinite(requested) or requested < 0:
+        return float(fallback)
+    if requested > _MAX_RETRY_AFTER_SECONDS:
+        return None
+    return requested
+
+
+def _usage_int(value: Any) -> int:
+    try:
+        parsed = int(value or 0)
+    except (OverflowError, TypeError, ValueError):
+        return 0
+    return max(parsed, 0)
+
+
+def _usage_cost(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed >= 0 else None
+
+
 def _in_body_error(payload: dict[str, Any]) -> OpenRouterResponseError | None:
     error = payload.get("error")
     if error is None:
@@ -111,7 +159,7 @@ def _in_body_error(payload: dict[str, Any]) -> OpenRouterResponseError | None:
         code_value = None
     try:
         code = int(code_value) if code_value is not None else None
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         code = None
     label = str(code) if code is not None else "unknown"
     return OpenRouterResponseError(
@@ -142,7 +190,12 @@ class OpenRouterClient:
         self._http = httpx.AsyncClient(
             base_url=settings.base_url,
             headers=headers,
-            timeout=httpx.Timeout(settings.timeout_seconds),
+            timeout=httpx.Timeout(
+                settings.timeout_seconds,
+                connect=min(settings.timeout_seconds, 30.0),
+                pool=min(settings.timeout_seconds, 30.0),
+                write=min(settings.timeout_seconds, 60.0),
+            ),
             transport=transport,
         )
 
@@ -171,15 +224,42 @@ class OpenRouterClient:
         }
 
         started = time.perf_counter()
+        deadline = started + self.settings.total_timeout_seconds
+        total_timeout_error = (
+            f"OpenRouter request exceeded the configured "
+            f"{self.settings.total_timeout_seconds:g}-second total timeout"
+        )
+
+        async def wait_before_retry(delay: float) -> None:
+            if delay >= deadline - time.perf_counter():
+                raise OpenRouterError(total_timeout_error)
+            await self._sleep(delay)
+
         last_error = "request failed"
         total_attempts = self.settings.max_retries + 1
+        ambiguous_outcome_attempts = 0
         for attempt in range(1, total_attempts + 1):
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise OpenRouterError(total_timeout_error)
             try:
-                response = await self._http.post("/chat/completions", json=payload)
+                async with asyncio.timeout(remaining):
+                    response = await self._http.post("/chat/completions", json=payload)
+            except TimeoutError as exc:
+                raise OpenRouterError(total_timeout_error) from exc
             except httpx.RequestError as exc:
                 last_error = f"network error: {exc.__class__.__name__}"
-                if attempt < total_attempts:
-                    await self._sleep(min(2 ** (attempt - 1), 8))
+                is_pre_request = isinstance(
+                    exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+                )
+                if not is_pre_request:
+                    ambiguous_outcome_attempts += 1
+                retryable = is_pre_request or (
+                    not isinstance(exc, httpx.ReadTimeout)
+                    and ambiguous_outcome_attempts < _MAX_AMBIGUOUS_ATTEMPTS
+                )
+                if retryable and attempt < total_attempts:
+                    await wait_before_retry(_retry_delay(attempt))
                     continue
                 raise OpenRouterError(last_error) from exc
 
@@ -193,15 +273,21 @@ class OpenRouterClient:
                 except OpenRouterResponseError as exc:
                     last_error = str(exc)
                     if exc.retryable and attempt < total_attempts:
-                        await self._sleep(min(2 ** (attempt - 1), 8))
-                        continue
+                        delay = _retry_delay(attempt, response.headers.get("Retry-After"))
+                        if delay is not None:
+                            await wait_before_retry(delay)
+                            continue
                     raise
                 except OpenRouterError as exc:
                     # A 2xx with no usable assistant message is still an upstream failure.
                     # Retrying covers truncated reasoning-only and malformed provider responses.
                     last_error = str(exc)
-                    if attempt < total_attempts:
-                        await self._sleep(min(2 ** (attempt - 1), 8))
+                    ambiguous_outcome_attempts += 1
+                    if (
+                        attempt < total_attempts
+                        and ambiguous_outcome_attempts < _MAX_AMBIGUOUS_ATTEMPTS
+                    ):
+                        await wait_before_retry(_retry_delay(attempt))
                         continue
                     raise
 
@@ -209,12 +295,10 @@ class OpenRouterClient:
             retryable = _is_retryable_code(response.status_code, last_error)
             if retryable and attempt < total_attempts:
                 retry_after = response.headers.get("Retry-After")
-                try:
-                    delay = float(retry_after) if retry_after is not None else 2 ** (attempt - 1)
-                except ValueError:
-                    delay = 2 ** (attempt - 1)
-                await self._sleep(min(max(delay, 0), 30))
-                continue
+                delay = _retry_delay(attempt, retry_after)
+                if delay is not None:
+                    await wait_before_retry(delay)
+                    continue
             raise OpenRouterError(f"OpenRouter HTTP {response.status_code}: {last_error}")
 
         raise OpenRouterError(last_error)  # pragma: no cover - loop always returns or raises
@@ -247,25 +331,24 @@ class OpenRouterClient:
                     )
                 raise OpenRouterError("OpenRouter returned an empty completion")
 
-            usage = payload.get("usage") or {}
-            if not isinstance(usage, dict):
-                raise TypeError("usage is not an object")
-            completion_details = usage.get("completion_tokens_details") or {}
-            if not isinstance(completion_details, dict):
-                raise TypeError("completion token details are not an object")
-            cost_value = usage.get("cost")
-            cost = float(cost_value) if cost_value is not None else None
-            if cost is not None and not math.isfinite(cost):
-                raise ValueError("cost is not finite")
-
-            prompt_tokens = int(usage.get("prompt_tokens") or 0)
-            completion_tokens = int(usage.get("completion_tokens") or 0)
-            reasoning_tokens = int(completion_details.get("reasoning_tokens") or 0)
-            total_tokens = int(usage.get("total_tokens") or 0)
         except OpenRouterError:
             raise
         except (AttributeError, ValueError, KeyError, IndexError, TypeError) as exc:
             raise OpenRouterError("OpenRouter returned a malformed completion response") from exc
+
+        # A usable answer is more valuable than perfect optional accounting metadata. Never
+        # regenerate a potentially expensive completion merely because its usage shape is bad.
+        usage_value = payload.get("usage") or {}
+        usage = usage_value if isinstance(usage_value, dict) else {}
+        details_value = usage.get("completion_tokens_details") or {}
+        completion_details = details_value if isinstance(details_value, dict) else {}
+        prompt_tokens = _usage_int(usage.get("prompt_tokens"))
+        completion_tokens = _usage_int(usage.get("completion_tokens"))
+        reasoning_tokens = _usage_int(completion_details.get("reasoning_tokens"))
+        total_tokens = _usage_int(usage.get("total_tokens"))
+        if not total_tokens:
+            total_tokens = prompt_tokens + completion_tokens
+        cost = _usage_cost(usage.get("cost"))
 
         return CompletionResult(
             analysis=content,

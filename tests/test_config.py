@@ -8,8 +8,10 @@ def test_settings_defaults() -> None:
 
     assert settings.api_key == "secret"
     assert settings.model == "moonshotai/kimi-k3"
-    assert settings.max_tokens == 16_000
-    assert settings.max_retries == 2
+    assert settings.max_tokens == 256_000
+    assert settings.max_retries == 7
+    assert settings.timeout_seconds == 7_200
+    assert settings.total_timeout_seconds == 15_000
     assert "secret" not in repr(settings)
 
 
@@ -26,6 +28,7 @@ def test_settings_require_key() -> None:
         ("K3MCP_TIMEOUT_SECONDS", "-1"),
         ("K3MCP_TIMEOUT_SECONDS", "nan"),
         ("K3MCP_TIMEOUT_SECONDS", "inf"),
+        ("K3MCP_TOTAL_TIMEOUT_SECONDS", "0"),
         ("K3MCP_MAX_ATTEMPTS", "0"),
     ],
 )

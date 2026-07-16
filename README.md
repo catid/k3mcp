@@ -48,7 +48,7 @@ env_vars = ["OPENROUTER_API_KEY"]
 enabled = true
 required = false
 startup_timeout_sec = 20
-tool_timeout_sec = 600
+tool_timeout_sec = 15600
 default_tools_approval_mode = "approve"
 ```
 
@@ -72,10 +72,11 @@ The process writes MCP protocol messages to stdout. Application logs must go to 
 | `OPENROUTER_API_KEY` | required | OpenRouter credential |
 | `OPENROUTER_MODEL` | `moonshotai/kimi-k3` | Model slug |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | API root |
-| `K3MCP_MAX_TOKENS` | `16000` | Maximum completion tokens per call |
+| `K3MCP_MAX_TOKENS` | `256000` | Maximum completion tokens per call |
 | `K3MCP_MAX_INPUT_CHARS` | `400000` | Combined system and user prompt limit |
-| `K3MCP_TIMEOUT_SECONDS` | `600` | Per-attempt HTTP timeout |
-| `K3MCP_MAX_ATTEMPTS` | `3` | Total attempts for retryable failures |
+| `K3MCP_TIMEOUT_SECONDS` | `7200` | Per-attempt response-read timeout |
+| `K3MCP_TOTAL_TIMEOUT_SECONDS` | `15000` | Total call deadline including retries |
+| `K3MCP_MAX_ATTEMPTS` | `8` | Total attempts for retryable failures |
 | `K3MCP_REASONING_EFFORT` | `max` | OpenRouter reasoning effort |
 | `OPENROUTER_APP_NAME` | `k3mcp` | OpenRouter attribution title |
 | `OPENROUTER_SITE_URL` | repository URL | OpenRouter attribution referrer |
@@ -97,7 +98,14 @@ credits. Retry tests cover network failures, rate limits, every `5xx` status, ma
 successful responses, and OpenRouter's occasional transient `invalid model ID` response for an
 otherwise live model slug. OpenRouter can report provider failures inside HTTP `200` responses;
 those are classified by their embedded status so billing, authentication, guardrail, and token-cap
-errors are not retried. Retries use bounded exponential backoff and honor `Retry-After`.
+errors are not retried. Explicit transient provider responses and connection-establishment failures
+use the full retry budget. Ambiguous failures that may already have incurred usage are retried at
+most once, and read timeouts are not retried. Backoff is bounded; `Retry-After` supports both
+delta-seconds and HTTP dates up to five minutes, while longer cooldowns fail without retrying early.
+Connection and pool waits are capped at 30 seconds and request writes at 60 seconds, independently
+of the longer response-read timeout needed for high-effort K3 completions. The server's total call
+deadline is deliberately 10 minutes shorter than the sample MCP client timeout, leaving time to
+return a structured error instead of being cancelled by the client.
 
 GitHub Actions runs linting, formatting, tests, the stdio protocol handshake, and package builds on
 Python 3.11, 3.12, and 3.13. Workflow actions are pinned to immutable commit SHAs.
@@ -106,6 +114,8 @@ Python 3.11, 3.12, and 3.13. Workflow actions are pinned to immutable commit SHA
 
 - Tool calls send the supplied code and project context to OpenRouter and its selected provider.
 - The server is read-only but calls a metered external API (`openWorldHint=true`).
+- The 256,000-token completion setting is a ceiling, not a reservation, but long reasoning calls
+  can still consume substantial metered output tokens.
 - Inputs and outputs are bounded by environment-configurable limits.
 - Errors never include request headers or the API key.
 - Model output is advisory. Verify findings and plans before applying changes.
